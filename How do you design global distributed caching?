@@ -1,0 +1,371 @@
+How do you design global distributed caching?
+
+global distributed caching for microservices is one of those tricky engineering problems where a few simple rules + the right tools produce big wins. I’ll give you a practical design (tradeoffs, patterns, and operational concerns) plus concrete Java code examples you can drop into a Spring Boot microservice:
+
+Cache-aside (recommended default) with Redis + Caffeine near-cache
+
+Write-through / write-behind examples (when you need stronger write guarantees)
+
+Stampede protection (locks / probabilistic early expiry)
+
+Invalidation/consistency patterns (pub/sub, versioning)
+
+Multi-region/scale notes
+
+I’ll keep each example focused and production-ready.
+
+Quick glossary (short)
+
+Near-cache: local in-process cache (very low latency) e.g., Caffeine.
+
+Distributed cache: shared cache across services/nodes, e.g., Redis, Hazelcast, Couchbase.
+
+Cache-aside: app reads cache, on miss reads DB then populates cache. (most common)
+
+Write-through / Write-behind: writes go to cache and (sync/async) to DB.
+
+Cache stampede: many clients thundering to DB on expiry.
+
+Invalidation: removing or updating cache entries to keep correctness.
+
+Design principles & tradeoffs
+
+Decide correctness vs performance
+
+If stale reads are acceptable → prefer aggressive caching + TTL.
+
+If strong consistency required → rely on DB or implement distributed transactions (rarely worth it).
+
+Use two-level caches for best latency vs consistency
+
+Caffeine (local) + Redis (distributed). Local caches reduce latency but require invalidation.
+
+Choose patterns by use-case
+
+Read-heavy: Cache-aside + TTL + background refresh.
+
+High write/consistency: Write-through or consider an event-sourcing pattern.
+
+Queue/Batch processing: Write-behind can be OK.
+
+Prevent stampede
+
+Use distributed locks, request coalescing, probabilistic early expiry, or single-flight in JVM.
+
+Invalidation & synchronization
+
+Use Redis Pub/Sub (or Kafka) to broadcast invalidation events to near-caches.
+
+Use key versioning / cache keys containing data versions to avoid stale reads.
+
+Shard & replicate
+
+Use Redis Cluster for horizontal scaling; consistent hashing for client-side caches if you host your own clusters.
+
+Monitoring & metrics
+
+Track hit ratio, miss rate, avg latency, evictions, memory usage, replication lag.
+
+Security & operational
+
+Network access, authentication (ACLs), TLS, fail-open vs fail-closed behavior if cache fails.
+
+Core patterns + Java examples
+
+All examples assume Spring Boot (common in Java microservices). I’ll show:
+
+Two-level cache (Caffeine local + Redis distributed) — cache-aside
+
+Stampede protection (Redisson lock)
+
+Write-through example (synchronous)
+
+Invalidation with Redis Pub/Sub
+
+1) Two-level cache (Caffeine near-cache + Redis distributed) — cache-aside (recommended)
+
+Behavior: Try local cache → if miss then distributed cache → if miss then DB → populate Redis + local cache.
+
+Maven deps (pom.xml)
+<!-- Spring boot, Redis, lettuce, caffeine -->
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-data-redis</artifactId>
+</dependency>
+<dependency>
+  <groupId>com.github.ben-manes.caffeine</groupId>
+  <artifactId>caffeine</artifactId>
+</dependency>
+<dependency>
+  <groupId>org.redisson</groupId>
+  <artifactId>redisson-spring-boot-starter</artifactId>
+  <version>3.19.0</version>
+</dependency>
+
+Spring config (Redis + Caffeine) — simplified
+@Configuration
+public class CacheConfig {
+
+    @Bean
+    public CacheManager cacheManager(RedisConnectionFactory rcf) {
+        // RedisCacheManager for distributed cache
+        RedisCacheConfiguration redisCfg = RedisCacheConfiguration.defaultCacheConfig()
+            .entryTtl(Duration.ofMinutes(10))
+            .serializeValuesWith(RedisSerializationContext.SerializationPair.fromSerializer(
+                new GenericJackson2JsonRedisSerializer()
+            ));
+
+        RedisCacheManager redisCacheManager = RedisCacheManager.builder(rcf)
+            .cacheDefaults(redisCfg)
+            .build();
+
+        // We'll store local Caffeine cache separately (manual composite usage)
+        return redisCacheManager;
+    }
+
+    @Bean
+    public com.github.benmanes.caffeine.cache.Cache<String, Object> caffeineCache() {
+        return Caffeine.newBuilder()
+                .maximumSize(10_000)
+                .expireAfterWrite(Duration.ofSeconds(30)) // keep small local TTL
+                .build();
+    }
+}
+
+Service using two-level cache (cache-aside)
+@Service
+public class ProductService {
+
+    private final com.github.benmanes.caffeine.cache.Cache<String, Product> localCache;
+    private final RedisTemplate<String, Product> redisTemplate;
+    private final ProductRepository repo; // JPA/DAO
+
+    public ProductService(com.github.benmanes.caffeine.cache.Cache<String, Product> caffeine,
+                          RedisTemplate<String, Product> redisTemplate,
+                          ProductRepository repo) {
+        this.localCache = caffeine;
+        this.redisTemplate = redisTemplate;
+        this.repo = repo;
+    }
+
+    private String key(String id) {
+        return "product:" + id;
+    }
+
+    public Product getProduct(String id) {
+        // 1. Local cache
+        Product local = localCache.getIfPresent(id);
+        if (local != null) return local;
+
+        // 2. Distributed cache (Redis)
+        String k = key(id);
+        Product cached = redisTemplate.opsForValue().get(k);
+        if (cached != null) {
+            localCache.put(id, cached);
+            return cached;
+        }
+
+        // 3. DB (source of truth)
+        Product fromDb = repo.findById(id).orElse(null);
+        if (fromDb != null) {
+            redisTemplate.opsForValue().set(k, fromDb, Duration.ofMinutes(10));
+            localCache.put(id, fromDb);
+        } else {
+            // Negative caching to avoid DB hammer for missing keys
+            redisTemplate.opsForValue().set(k, Product.EMPTY, Duration.ofMinutes(1));
+        }
+        return fromDb;
+    }
+
+    public Product updateProduct(String id, ProductUpdate update) {
+        Product updated = repo.update(id, update); // transactional update
+        // write-through style: update cache synchronously
+        String k = key(id);
+        redisTemplate.opsForValue().set(k, updated, Duration.ofMinutes(10));
+        localCache.invalidate(id);
+        // Optionally publish invalidation event (see section below)
+        return updated;
+    }
+}
+
+
+Notes
+
+Local cache TTL is tiny (30s) so consistency window is small.
+
+Negative caching prevents repeated DB hits for missing keys.
+
+Serializers: use JSON or other efficient format; be careful with schema changes.
+
+2) Preventing stampede: single-flight / distributed lock (Redisson)
+
+When multiple nodes try to load the same cold cache key, you want one loader and others to wait (or return stale).
+
+Redisson single-lock example
+public Product getProductWithLock(String id) {
+    Product local = localCache.getIfPresent(id);
+    if (local != null) return local;
+
+    String k = key(id);
+
+    // check Redis first
+    Product redisCached = redisTemplate.opsForValue().get(k);
+    if (redisCached != null) {
+        localCache.put(id, redisCached);
+        return redisCached;
+    }
+
+    // acquire distributed lock for this key
+    RLock lock = redissonClient.getLock("lock:" + k);
+    boolean locked = false;
+    try {
+        locked = lock.tryLock(0, 5, TimeUnit.SECONDS);
+        if (locked) {
+            // double-check Redis after acquiring lock
+            Product afterLock = redisTemplate.opsForValue().get(k);
+            if (afterLock != null) {
+                localCache.put(id, afterLock);
+                return afterLock;
+            }
+            Product fromDb = repo.findById(id).orElse(null);
+            if (fromDb != null) {
+                redisTemplate.opsForValue().set(k, fromDb, Duration.ofMinutes(10));
+                localCache.put(id, fromDb);
+            }
+            return fromDb;
+        } else {
+            // couldn't acquire lock → fallback: wait a bit and re-check, or return fallback
+            Thread.sleep(100); // small backoff
+            return getProduct(id);
+        }
+    } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        return null;
+    } finally {
+        if (locked) {
+            lock.unlock();
+        }
+    }
+}
+
+
+Alternatives: use request coalescing libraries or an in-JVM singleflight.
+
+3) Write-through (synchronous) and Write-behind (async) patterns
+Write-through (simpler, consistent with cache)
+
+Writes go to cache first, then synchronously to DB.
+
+Good when you want reads to be fast and consistent for a short window.
+
+public Product saveProduct(Product p) {
+    // write to DB first or to cache first? Many do DB then cache to avoid cache poisoning.
+    Product saved = repo.save(p);
+    String k = key(saved.getId());
+    redisTemplate.opsForValue().set(k, saved, Duration.ofMinutes(10));
+    localCache.invalidate(saved.getId());
+    // publish invalidation or update event
+    return saved;
+}
+
+Write-behind (async)
+
+Writes are enqueued and processed asynchronously to the DB; risk of data loss but can be faster.
+
+Requires durable queue and at-least-once semantics.
+
+Implementation sketch:
+
+On write, push event to Redis Stream / Kafka and return.
+
+A background consumer reads stream and applies to DB (retry on failure).
+
+4) Invalidation strategies (how to keep near-caches coherent)
+Redis Pub/Sub invalidation (simple)
+
+After any write/update/delete, publish a message with the key/version.
+
+Each app node subscribes and invalidates its local cache.
+
+Publisher:
+
+redisTemplate.convertAndSend("cache:invalidation", key);
+
+
+Subscriber:
+
+@Component
+public class CacheInvalidationListener {
+
+    private final com.github.benmanes.caffeine.cache.Cache<String, Product> localCache;
+
+    @Autowired
+    public CacheInvalidationListener(RedisMessageListenerContainer container,
+                                     com.github.benmanes.caffeine.cache.Cache<String, Product> localCache) {
+        this.localCache = localCache;
+        container.addMessageListener((message, pattern) -> {
+            String key = new String(message.getBody(), StandardCharsets.UTF_8);
+            String id = extractIdFromKey(key);
+            localCache.invalidate(id);
+        }, new ChannelTopic("cache:invalidation"));
+    }
+}
+
+
+Note: Redis pub/sub is fire-and-forget and ephemeral (if a node is down, it misses messages). For more reliable invalidation use Kafka or Redis Streams.
+
+Key versioning technique
+
+Store a version or etag in the cache key: product:{id}:{version}.
+
+On update increment the version in DB; clients fetching by id will check latest version mapping. This is more complex but avoids some race conditions.
+
+5) Multi-region/global cache considerations
+
+Option A: Central Redis cluster with low-latency network (if latency acceptable).
+
+Option B: Deploy regional Redis clusters + use local cluster for reads; use asynchronous replication or CDC to sync writes (eventual consistency).
+
+Option C: Use a managed geo-replicated cache (e.g., Redis Enterprise Active-Active / CRDTs) if you need multi-master with conflict resolution.
+
+For multi-region:
+
+Prefer read-local, write-local with async replication, accept eventual consistency.
+
+Use versioning or last-write-wins carefully; reason about conflicts for concurrent updates.
+
+6) Cache key design & serialization
+
+Keep keys short but readable: product:{id} or user:{id}:profile:v2.
+
+Include tenant id for multi-tenant apps.
+
+Use a stable serializer (JSON with Jackson or MessagePack). Be careful with classpath changes; prefer schema or DTO models.
+
+7) Avoiding common pitfalls
+
+No requests/limits: over-caching can cause memory pressure. Monitor evictions.
+
+Large objects: serialize/ compress large payloads or cache only IDs + small fields.
+
+Cache poisoning: on error don't write erroneous responses into cache.
+
+Cache explosion: paginate and limit cardinality; avoid caching per-user-per-very-specific-filters unless necessary.
+
+Security: never cache private user secrets without encryption.
+
+8) Metrics & monitoring (what to measure)
+
+Cache hit ratio (local and distributed)
+
+Miss rate and DB calls per second
+
+Avg cache lookup latency
+
+Evictions and memory usage
+
+Pub/Sub dropped events / replication lag
+
+Errors during serialization/deserialization
+
+Expose via Micrometer (Prometheus) and alert on falling hit ratio or rising evictions.
