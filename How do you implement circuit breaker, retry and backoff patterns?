@@ -1,0 +1,224 @@
+How do you implement circuit breaker, retry and backoff patterns?
+
+clean and production-style explanation with Java examples using Resilience4j, the modern and most widely used library for Circuit Breaker, Retry, and Backoff patterns in microservices.
+
+You’ll see:
+
+Architecture overview
+
+Circuit Breaker example
+
+Retry example
+
+Retry + Exponential Backoff example
+
+Combining all patterns (the way it’s done in real microservices)
+
+Spring Boot & plain Java examples
+
+✅ 1. Why use Resilience4j?
+
+Resilience4j provides:
+
+CircuitBreaker
+
+Retry (with backoff)
+
+RateLimiter
+
+Bulkhead
+
+TimeLimiter
+
+It is lightweight, functional-style, supports both Spring Boot and pure Java, and is commonly used in microservices.
+
+📦 Dependencies (Maven)
+<dependency>
+    <groupId>io.github.resilience4j</groupId>
+    <artifactId>resilience4j-spring-boot3</artifactId>
+    <version>2.2.0</version>
+</dependency>
+
+
+For non-Spring, use:
+
+<dependency>
+    <groupId>io.github.resilience4j</groupId>
+    <artifactId>resilience4j-core</artifactId>
+    <version>2.2.0</version>
+</dependency>
+
+🧵 2. CIRCUIT BREAKER EXAMPLE (with fallback)
+Spring Boot Example
+@Service
+public class PaymentService {
+
+    private final WebClient client = WebClient.create("https://payment.example.com");
+
+    @CircuitBreaker(name = "paymentCB", fallbackMethod = "fallback")
+    public Mono<String> processPayment(String orderId) {
+        return client.get()
+                .uri("/pay/" + orderId)
+                .retrieve()
+                .bodyToMono(String.class);
+    }
+
+    public Mono<String> fallback(String orderId, Throwable ex) {
+        return Mono.just("Payment service unavailable. Please try again later.");
+    }
+}
+
+
+behavior:
+
+When failures (timeout, 500 error, connection failure) exceed threshold → circuit opens
+
+All calls fail fast using fallback
+
+After wait duration → half-open → test calls → closes if successful
+
+⚙️ Circuit Breaker Config (application.yml)
+resilience4j:
+  circuitbreaker:
+    instances:
+      paymentCB:
+        slidingWindowSize: 10
+        permittedNumberOfCallsInHalfOpenState: 3
+        failureRateThreshold: 50
+        waitDurationInOpenState: 5s
+        automaticTransitionFromOpenToHalfOpenEnabled: true
+
+🔁 3. RETRY PATTERN EXAMPLE
+Spring Boot
+@Service
+public class InventoryService {
+
+    @Retry(name = "inventoryRetry", fallbackMethod = "fallback")
+    public String checkStock(String itemId) {
+        // Simulate remote call
+        if (Math.random() > 0.7) {
+            return "IN_STOCK";
+        }
+        throw new RuntimeException("Inventory service unstable");
+    }
+
+    public String fallback(String itemId, Throwable ex) {
+        return "Stock information unavailable";
+    }
+}
+
+Retry config
+resilience4j:
+  retry:
+    instances:
+      inventoryRetry:
+        maxAttempts: 3
+        waitDuration: 200ms
+
+🔄 4. RETRY WITH EXPONENTIAL BACKOFF
+
+Resilience4j supports exponential backoff natively.
+
+resilience4j:
+  retry:
+    instances:
+      inventoryRetry:
+        maxAttempts: 5
+        waitDuration: 200ms
+        enableExponentialBackoff: true
+        exponentialBackoffMultiplier: 2
+
+
+This results in delays:
+
+200 ms
+
+400 ms
+
+800 ms
+
+1.6 s
+
+…
+
+🧩 5. COMBINING CIRCUIT BREAKER + RETRY + BACKOFF
+Real microservice example
+@Service
+public class ShippingService {
+
+    private final RestTemplate restTemplate;
+
+    public ShippingService(RestTemplateBuilder builder) {
+        this.restTemplate = builder.build();
+    }
+
+    @CircuitBreaker(name = "shippingCB", fallbackMethod = "fallback")
+    @Retry(name = "shippingRetry")
+    public String shipOrder(String orderId) {
+        return restTemplate.getForObject(
+                "http://shipping-service/ship/" + orderId, 
+                String.class
+        );
+    }
+
+    public String fallback(String orderId, Throwable ex) {
+        return "Shipping temporarily unavailable";
+    }
+}
+
+📘 Combined config
+resilience4j:
+  circuitbreaker:
+    instances:
+      shippingCB:
+        slidingWindowSize: 20
+        failureRateThreshold: 50
+        waitDurationInOpenState: 10s
+
+  retry:
+    instances:
+      shippingRetry:
+        maxAttempts: 3
+        waitDuration: 500ms
+        enableExponentialBackoff: true
+        exponentialBackoffMultiplier: 1.5
+
+
+This means:
+
+If remote call fails → retries with exponential backoff
+
+If repeated failures exceed thresholds → circuit opens
+
+Further calls immediately trigger fallback
+
+🧪 6. PURE JAVA EXAMPLES (No Spring Boot)
+Set up CircuitBreaker, Retry, & Decorators
+CircuitBreaker circuitBreaker = CircuitBreaker.ofDefaults("cb");
+Retry retry = Retry.ofDefaults("retry");
+
+Supplier<String> supplier = () -> {
+    if (Math.random() > 0.5) throw new RuntimeException("Failure");
+    return "Success!";
+};
+
+// Decorate the supplier with CB + Retry
+Supplier<String> decorated = 
+    Decorators.ofSupplier(supplier)
+              .withCircuitBreaker(circuitBreaker)
+              .withRetry(retry)
+              .decorate();
+
+try {
+    System.out.println(decorated.get());
+} catch (Exception e) {
+    System.out.println("Fallback response");
+}
+
+🧭 7. When to use each pattern
+Pattern	When to use
+Retry	Temporary network error, service flaky for a moment
+Exponential Backoff	Avoid hammering a struggling service
+Circuit Breaker	Prevent cascading failures across microservices
+Bulkhead	Protect threads and isolate failures
+RateLimiter	Throttle upstream requests
