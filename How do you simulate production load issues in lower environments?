@@ -1,0 +1,292 @@
+How do you simulate production load issues in lower environments?
+Below is a clean, practical guide to simulate production-like load issues in lower environments, with actual Java examples that reproduce:
+
+✔ CPU saturation
+✔ Memory pressure / leaks
+✔ Thread-pool starvation
+✔ Connection-pool exhaustion
+✔ Slow downstream dependencies
+✔ GC pressure
+✔ Load testing patterns (JMeter/Gatling)
+
+This is all safe to run in dev/stage (not prod).
+
+1) CPU Saturation Simulation
+
+Useful to test HPA scaling, thread starvation, or request latency under CPU pressure.
+
+Java example — burn CPU in a controlled endpoint
+@GetMapping("/cpu")
+public String burnCpu() {
+    long end = System.currentTimeMillis() + 5000; // 5 seconds of CPU burn
+    long x = 0;
+    while (System.currentTimeMillis() < end) {
+        x = x * x + 1;   // useless computation
+    }
+    return "CPU burn done: " + x;
+}
+
+Testing approach
+
+Send many requests using JMeter, k6, or Gatling:
+
+ab -n 1000 -c 100 http://localhost:8080/cpu
+
+Outcome
+
+You observe spikes in CPU, increased latency, thread-pool contention.
+
+Validate autoscaling (HPA) and resilience patterns (timeouts/circuit breakers).
+
+2) Memory Pressure & Memory Leak Simulation
+Java example — grow heap intentionally
+List<byte[]> memoryLeak = new ArrayList<>();
+
+@GetMapping("/leak")
+public String leak() {
+    byte[] chunk = new byte[5 * 1024 * 1024]; // 5 MB
+    memoryLeak.add(chunk);                    // keep reference
+    return "Allocated 5MB, list size = " + memoryLeak.size();
+}
+
+How to test
+
+Call repeatedly:
+
+watch -n 0.5 curl http://localhost:8080/leak
+
+What you get
+
+Heap grows steadily.
+
+GC cycles increase.
+
+Eventually OOMKilled (in k8s) or java.lang.OutOfMemoryError.
+
+Good for testing memory dashboards, alerts, heap dump collection scripts.
+
+3) Thread-Pool Starvation Simulation
+Java example — block executor threads
+
+Use a controller method that sleeps for a long time.
+
+@GetMapping("/block")
+public String block() throws InterruptedException {
+    Thread.sleep(15000);  // block for 15 seconds
+    return "done";
+}
+
+Test with concurrency
+ab -n 200 -c 50 http://localhost:8080/block
+
+Outcome
+
+Your Tomcat/Jetty thread-pool becomes exhausted.
+
+Requests hang → UI timeouts → app degradation.
+
+Perfect for testing bulkheads, async code, and tuning server.tomcat.max-threads.
+
+4) Connection Pool (DB / HTTP) Exhaustion Simulation
+HikariCP exhaustion simulation
+
+Open many connections but never return them:
+
+@Autowired
+DataSource ds;
+
+@GetMapping("/db-hang")
+public String dbHang() throws Exception {
+    Connection c = ds.getConnection(); // never closing it
+    Thread.sleep(60000);
+    return "Kept connection for 60s";
+}
+
+Outcome
+
+HikariCP’s active connections climb to maxPoolSize.
+
+New calls fail with:
+Timeout waiting for connection from pool
+
+Helps validate monitoring & alerting on DB pools.
+
+⚠️ Remember to fix code after simulation.
+
+5) Simulate Slow Downstream Dependency
+Fake slow remote call
+@GetMapping("/slow-upstream")
+public String slowUpstream() throws InterruptedException {
+    Thread.sleep(8000); // simulate 8s slow downstream
+    return "slow response";
+}
+
+
+Call it from another service to simulate a real dependency.
+
+Outcome
+
+Test retry, timeout, circuit breaker, fallback.
+
+Validate end-to-end timeouts (client timeout < server timeout).
+
+6) GC Pressure Simulation
+
+Use large short-lived objects inside a loop:
+
+@GetMapping("/gc")
+public String createGarbage() {
+    for (int i = 0; i < 50_000_000; i++) {
+        String s = new String("ABC");  // forces new objects
+    }
+    return "GC pressure generated";
+}
+
+Outcome
+
+Observe frequent GC cycles.
+
+Validate GC logging and monitoring pipelines (Grafana/Prometheus).
+
+7) Simulating Load Using Tools (recommended)
+A. JMeter
+
+Use a Thread Group setup that mirrors production traffic distribution:
+
+500–2000 users
+
+ramp-up 30s–2min
+
+mix of APIs
+
+think time between requests
+
+Run:
+
+jmeter -n -t test-plan.jmx -l results.jtl
+
+B. Gatling (Scala or Java DSL)
+
+Example simulation:
+
+class BasicLoad extends Simulation {
+  val httpProtocol = http.baseUrl("http://localhost:8080")
+
+  val scn = scenario("LoadTest")
+    .exec(http("cpu").get("/cpu"))
+    .pause(1)
+    .exec(http("block").get("/block"))
+
+  setUp(
+    scn.inject(
+      rampUsers(500) during (60.seconds)
+    )
+  ).protocols(httpProtocol)
+}
+
+C. k6
+k6 run loadtest.js
+
+8) Simulate Production-Like Chaos
+Using Chaos Monkey for Spring Boot
+
+Add dependency:
+
+<dependency>
+  <groupId>de.codecentric</groupId>
+  <artifactId>chaos-monkey-spring-boot</artifactId>
+  <version>2.5.2</version>
+</dependency>
+
+
+Enable chaos:
+
+chaos:
+  monkey:
+    enabled: true
+    assaults:
+      latencyActive: true
+      latencyRangeStart: 3000
+      latencyRangeEnd: 12000
+
+Outcome
+
+Random latency
+
+Random exceptions
+
+Request aborts
+
+JVM resource pressure
+Great for resiliency pattern testing.
+
+9) Essential Production-Issue Simulations to Run Before Go-Live
+✔ Load test
+
+Ensure the service’s max throughput & breaking point.
+
+✔ Stress test
+
+Push beyond safe limits — find failure mode.
+
+✔ Soak test
+
+Run 3–8 hours to detect memory leaks.
+
+✔ Chaos test
+
+Kill pods, simulate slow downstreams, DNS errors, packet loss.
+
+✔ Failover test
+
+Simulate node failures, pod evictions, scaling events.
+
+10) Example: Combining These into a “Load Issue Emulator” Controller
+
+You can create a dedicated simulation controller (disabled in prod):
+
+@RestController
+@RequestMapping("/simulate")
+public class SimulationController {
+
+    private final List<byte[]> memory = new ArrayList<>();
+
+    @GetMapping("/cpu")
+    public String cpu() {
+        long end = System.currentTimeMillis() + 4000;
+        while (System.currentTimeMillis() < end) {}
+        return "CPU simulated";
+    }
+
+    @GetMapping("/memory")
+    public String memory() {
+        memory.add(new byte[5 * 1024 * 1024]);
+        return "Added 5MB, total chunks: " + memory.size();
+    }
+
+    @GetMapping("/block")
+    public String block() throws Exception {
+        Thread.sleep(15000);
+        return "Blocked for 15 sec";
+    }
+
+    @GetMapping("/slow")
+    public String slow() throws Exception {
+        Thread.sleep(7000);
+        return "Slow endpoint done";
+    }
+
+    @GetMapping("/gc")
+    public String gc() {
+        for (int i = 0; i < 20_000_000; i++) {
+            new Object();
+        }
+        return "GC pressure";
+    }
+}
+
+
+Disable in prod:
+
+spring:
+  profiles: "!prod"
