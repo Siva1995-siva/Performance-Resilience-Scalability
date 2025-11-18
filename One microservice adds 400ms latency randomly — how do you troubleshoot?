@@ -1,0 +1,291 @@
+One microservice adds 400ms latency randomly — how do you troubleshoot?
+
+a clear, practical, production-style troubleshooting guide for a microservice that randomly adds ~400 ms latency. This kind of intermittent delay is one of the hardest to debug — but there are only a few root-cause categories. I’ll give you step-by-step diagnostics, probable causes, and how to find them with real commands, plus Java/Spring code examples that often cause this issue.
+
+✅ Step 1 — Confirm the pattern
+
+Before jumping to logs, answer:
+
+✔ Is the 400 ms a consistent minimum delay, or a random spike?
+
+Consistent 400 ms → usually DNS, connection pool wait, TLS handshake.
+
+Random 400 ms → GC pauses, thread starvation, lock contention, slow downstream calls.
+
+✔ Does it affect ALL endpoints or only one?
+
+All endpoints → GC, threadpool exhaustion, DNS/TLS.
+
+One endpoint → blocking I/O, DB query, expensive operation.
+
+✔ Is it in your service or downstream?
+
+Enable server & client trace IDs to see where the 400 ms occurs.
+
+✅ Step 2 — Add high-cardinality trace logging (first move)
+
+Enable timing in logs:
+
+long start = System.currentTimeMillis();
+// … actual logic
+log.info("Latency={}ms traceId={}", System.currentTimeMillis() - start, traceId);
+
+
+Then correlate with:
+
+DB logs
+
+Downstream logs
+
+GC logs
+
+Thread dumps
+
+Access logs (Nginx/API Gateway)
+
+This isolates which segment consumes the 400ms.
+
+✅ Step 3 — Collect evidence
+1) Thread dumps during a spike
+kubectl exec -it <pod> -- jstack <pid> > /tmp/tdump.txt
+
+
+Look for:
+
+Threads stuck in WAITING on DB pool / HTTP client pool
+
+Frequent parking under locks
+
+Same stack repeatedly showing blocking call
+
+Example sign of root cause:
+
+at com.zaxxer.hikari.pool.HikariPool.getConnection(...)
+WAITING on java.util.concurrent.locks.AbstractQueuedSynchronizer
+
+
+→ DB pool exhaustion → 100–500ms waits
+
+2) GC diagnostics
+
+Enable GC logging if not already:
+
+- Xlog:gc*:file=/logs/gc.log:time
+
+
+If you see:
+
+Pause Young (Normal) 350ms
+
+
+→ Minor GC pauses cause 300–500 ms latency spikes.
+
+3) Connection pool wait-time metrics
+
+Expose Hikari metrics:
+
+hikaricp.connections.acquire
+hikaricp.connections.active
+hikaricp.connections.pending
+
+
+If pending > 0 → calls waiting up to your connectionTimeout (default 30s), but often they spike around 300–500 ms.
+
+Typical misconfig example:
+
+spring.datasource.hikari.maximum-pool-size: 10
+
+
+But traffic requires 50+ concurrent threads → 400 ms stalls.
+
+4) Network & DNS
+
+Run:
+
+kubectl exec <pod> -- nslookup api.my-upstream.svc
+
+
+Or trace DNS latency:
+
+time curl -v http://upstream
+
+
+If random DNS lookup takes 200–500 ms → DNS cache misses or misconfigured search domains.
+
+Common cause:
+
+JVM default resolver + Kubernetes DNS slowness = 250–500 ms sometimes.
+
+Fix:
+
+-Dsun.net.inetaddr.ttl=60
+
+5) Downstream slow calls
+
+Enable client-side timing (WebClient or RestTemplate).
+
+For WebClient:
+exchange.filter((req, next) -> {
+    long t = System.currentTimeMillis();
+    return next.exchange(req)
+        .doOnSuccess(r -> log.info("Upstream latency {}ms", System.currentTimeMillis() - t));
+});
+
+
+If upstream occasionally takes 350–450 ms → issue is downstream.
+
+✅ Step 4 — Top Real-World Causes of Random 400 ms Latency
+
+Below are the most common, ranked by probability.
+
+1) Connection Pool Waiting (DB or HTTP) ⭐⭐⭐⭐⭐ (Most common)
+
+Symptoms:
+
+Latency spikes around 300–500 ms
+
+Thread dump shows threads waiting in Hikari
+
+Metrics show pending acquisition
+
+Example real culprit:
+
+maximumPoolSize=10
+
+
+but your service receives 200 concurrent requests → pool queue delay ≈ 400ms.
+
+Fix:
+
+Increase pool size
+
+Reduce request concurrency (bulkhead)
+
+Use async/reactive where possible
+
+2) Minor GC Pauses (G1 or Parallel) ⭐⭐⭐⭐
+
+Minor GCs often take 100–500 ms.
+
+Look for:
+
+Pause Young (Mixed) 420ms
+
+Fix:
+
+Increase heap
+
+Reduce allocation rate
+
+Tune G1GC: -XX:MaxGCPauseMillis=200
+
+3) DNS Resolution Delays ⭐⭐⭐⭐
+
+Random DNS slowness causes 250–500 ms delays.
+
+Typical in Kubernetes.
+
+Fix:
+
+Enable DNS caching:
+
+-Dsun.net.inetaddr.ttl=60
+
+
+Reduce search domains in k8s
+
+Use a sidecar DNS cache (NodeLocal DNSCache)
+
+4) Thread Pool Starvation ⭐⭐⭐
+
+If Tomcat/Netty threads are blocked, requests wait 300–700 ms before processing.
+
+Run:
+
+jstack | grep http-nio | wc -l
+
+
+Fix:
+
+server.tomcat.threads.max: 300
+
+5) Slow downstream dependency ⭐⭐⭐
+
+Your upstream occasionally spikes by 400ms.
+
+Check logs or tracing:
+
+Upstream latency: 412ms
+
+
+Fix:
+
+Timeouts
+
+Retries with jitter
+
+Circuit breakers
+
+Example timeout config:
+
+webclient:
+  connectTimeout: 200
+  readTimeout: 300
+
+6) Lock Contention in Your Code ⭐⭐⭐
+
+Java example that causes random 300–500ms pauses:
+
+synchronized(cache) {
+    cache.computeIfAbsent(...);  // heavy computation
+}
+
+
+Thread dumps show many threads BLOCKED on the same lock.
+
+Fix:
+
+Replace synchronized with ConcurrentHashMap
+
+Avoid blocking inside locks
+
+7) Cold Start / Lazy Init ⭐⭐
+
+Some microservices lazily load data on first call, causing one-time 200–700 ms latency.
+
+Fix:
+
+Warm-up APIs on startup
+
+Preload caches
+
+8) Network retries or Nagle’s algorithm ⭐⭐
+
+TCP-level jitter adds 200–400ms occasionally.
+
+Fix:
+
+System.setProperty("http.keepAlive", "true");
+
+🎯 Step 5 — Put it all together: 400 ms Latency Debug Checklist
+Immediate
+
+ Check thread-dump for pool waits
+
+ Check GC logs for pauses
+
+ Measure DNS resolution
+
+ Check DB/HTTP pool pending threads
+
+ Add request-level timing logs
+
+ Look at traces (Jaeger/Zipkin/Tempo/OpenTelemetry)
+
+If still unclear
+
+Capture pcap on pod
+
+Enable Java Flight Recorder (JFR)
+
+Run chaos load to provoke spikes on demand
